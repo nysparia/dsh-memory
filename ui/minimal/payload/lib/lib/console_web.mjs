@@ -123,6 +123,24 @@ export function installConsoleWeb(ctx, config, disposers, mdcg) {
   try {
     const web = ctx.get('webServer');
     if (!web) return;
+    // 病灶（DSH 0.2.3，commit 71753fdf91「add connection auth provider」）：宿主把鉴权拆成
+    // 独立服务 `connection.authentication`，HostConnectionService.admit() 内部读
+    // `this.authentication`；而 cordis 的 traceable 代理会把这次读取解析成「**调用方** ctx 上的
+    // connection.authentication」（vendor/cordis/src/utils.ts 的 tracker.associate 分支，让
+    // `ctx.foo.bar` 与 `ctx['foo.bar']` 同 def site）。本插件只声明 inject=['tools'] ⇒ 每个
+    // /plugins/lingshu/* 请求都在 admit() 处抛
+    // 「cannot get property "connection.authentication" without inject」⇒ 面板首屏 500。
+    // 修法：只在下面这个子作用域里注入鉴权服务，再从该作用域取 connection 交给 handler。
+    //   ① 校验语义不变：Host/Origin 栅栏仍在 admit() 内，authenticate 的 401/503 照旧；
+    //   ② 注入范围不扩散：插件其余代码仍只有 ['tools']，拿不到 connection.authentication 句柄；
+    //   ③ 取值必须发生在**请求期**（fiber 提交后），apply 当刻调用仍会抛（实测）。
+    let admitCtx = ctx;
+    if (typeof ctx.inject === 'function') {
+      try {
+        const disposeScope = ctx.inject(['connection', 'connection.authentication'], (scope) => { admitCtx = scope; });
+        if (typeof disposeScope === 'function') disposers.push(disposeScope);
+      } catch (error) { ctx.logger.warn(`dsh-memory: 鉴权子作用域挂载失败，沿用原上下文：${error.message}`); }
+    }
     // 每次请求读已构建的静态页面，刷新即可看到更新，避免 apply 时缓存旧 CSS/JS。
     const asset = (name) => () => readFileSync(new URL(`../../web/${name}`, import.meta.url), 'utf8');
     const assets = {
@@ -133,8 +151,10 @@ export function installConsoleWeb(ctx, config, disposers, mdcg) {
       '/plugins/lingshu/entry.js': [asset('entry.js'), 'application/javascript; charset=utf-8'],
     };
     // issue #699：传**取值函数**（每次请求实时取），不再把挂载瞬间的值闭包固化。
-    const handler = createConsoleHandler(mdcg, config, assets, () => ctx.get('connection'),
-      () => ({ any: !!ctx.get('connection', false) }), ctx.logger);
+    // 取 connection 的作用域必须是上面注入了 connection.authentication 的 admitCtx，
+    // 否则 admit() 仍会抛 without inject（见上方病灶注释）。
+    const handler = createConsoleHandler(mdcg, config, assets, () => admitCtx.get('connection'),
+      () => ({ any: !!admitCtx.get('connection', false) }), ctx.logger);
     for (const path of ['/lingshu', '/lingshu/', '/plugins/lingshu']) disposers.push(web.register({ kind: path === '/plugins/lingshu' ? 'prefix' : 'exact', path, handler }));
     disposers.push(web.tapIndex(html => html.includes('data-lingshu-entry') ? html : html.replace('</body>', '<script data-lingshu-entry src="/plugins/lingshu/entry.js"></script></body>')));
     ctx.logger.info('dsh-memory: 极简灵枢控制台已挂载 /lingshu（复用唯一大脑桥）');

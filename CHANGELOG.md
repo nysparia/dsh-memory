@@ -6,6 +6,16 @@
 
 ## [Unreleased]
 
+- **面板首屏 500：DSH 0.2.3 的 `connection.admit()` 对 `connection.authentication` 有隐式 inject 要求**：
+  宿主把鉴权拆成独立服务后，`HostConnectionService.admit()` 内部读 `this.authentication`，而 cordis 的
+  traceable 代理把这次读取解析成「**调用方** ctx 上的 `connection.authentication`」（`tracker.associate` 分支，
+  让 `ctx.foo.bar` 与 `ctx['foo.bar']` 同 def site）。本插件只声明 `inject=['tools']` ⇒ 每个
+  `/plugins/lingshu/*` 请求都在 `admit()` 处抛 `cannot get property "connection.authentication" without inject`
+  ⇒ 面板打不开。修法：`installConsoleWeb` 开一个只注入 `['connection','connection.authentication']` 的
+  **子作用域**，`connection` 改从该作用域取；校验语义（Host/Origin 栅栏 + `authenticate()` 的 401/503）
+  与注入范围（其余代码仍只有 `['tools']`）都不变。守卫 `test/console_web_connection.test.ts` 的 H/H′/H″
+  三条：走注入作用域 / 老宿主无 `ctx.inject` 时 fail-closed / 依赖不就绪时 fail-closed。
+
 - **`#997` `cg op=read` 返回体含大量调试/遥测字段**：`bm25` 统计、`path_fingerprint.provenance`
   全量、以及每条 `frontmatter` 的评分字段都会原样回给宿主，而 `budget_tokens` 只约束正文。
   新增 `_slim_read_out()`：缺省摘掉顶层与 `meta` 里的遥测块，`pack`/`results` 只留白名单键，
