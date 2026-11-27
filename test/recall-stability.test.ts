@@ -48,7 +48,7 @@ function makeCtx(): {
     async write() { return { ok: true } },
   } as never, {
     userMessage: true, assistantMessage: false, toolResult: false,
-    importance: 0.6, autoRecall: true, autoRecallLimit: 4, desensitize: true,
+    importance: 0.6, autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: true,
   })
   return { listeners }
 }
@@ -220,7 +220,7 @@ test('④ 记忆为空 / 召回失败：不注入、不抛错、next 照常', as
     async timeline() { throw new Error('认知图不可用') },
   } as never, {
     userMessage: true, assistantMessage: false, toolResult: false,
-    importance: 0.6, autoRecall: true, autoRecallLimit: 4, desensitize: true,
+    importance: 0.6, autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: true,
   })
   const assembly2: Assembly = { contexts: [], variables: {} }
   let next2 = false

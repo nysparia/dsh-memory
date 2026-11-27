@@ -39,7 +39,7 @@ function makeHarness(graph: object, overrides: Partial<MemoryHooksOptions> = {})
   }
   installMemoryHooks(ctx as never, graph as never, {
     userMessage: true, assistantMessage: true, toolResult: true,
-    importance: 0.6, autoRecall: true, autoRecallLimit: 4, desensitize: false,
+    importance: 0.6, autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: false,
     auditPath: join(tmpdir(), 'dsh-hook-audit-session-declaration-report.json'),
     ...overrides,
   })

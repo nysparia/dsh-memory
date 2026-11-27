@@ -124,7 +124,7 @@ test('⑥ 端到端：含 {{ 的记忆经注入后，宿主真函数可渲染', 
     assistantMessage: false,
     toolResult: false,
     importance: 0.6,
-    autoRecall: true,
+    autoRecall: true, injectVia: 'context' as const,
     autoRecallLimit: 4,
     desensitize: true,
   })

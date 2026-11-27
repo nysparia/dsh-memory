@@ -55,7 +55,7 @@ function makeCtx(opts: { readThrows?: boolean } = {}): {
     async write() { return { ok: true } },
   } as never, {
     userMessage: true, assistantMessage: false, toolResult: false,
-    importance: 0.6, autoRecall: true, autoRecallLimit: 4, desensitize: true,
+    importance: 0.6, autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: true,
   })
   return { listeners: listeners as never }
 }

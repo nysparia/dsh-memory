@@ -6,6 +6,20 @@
 
 ## [Unreleased]
 
+- **注入改走 `agent/pre-step` 自建消息（缺省），静态上下文不再被重复复制**：
+  旧实现把三块内容 push 进 `assembly.contexts`。宿主把**所有** contexts 拼成一份运行时
+  上下文快照（`dsh-agent-loop` 的 `RuntimeContextProjection`），按「整段文本是否与已提交
+  的那份相同」决定要不要追加，且**只追加不替换**。于是只要记忆块每步都变，整份快照就
+  每步重发，连 `working-directory` / `sandbox:policy` / `approval:policy` 等与记忆无关的
+  静态段一起复制。实测一条会话：22 份快照、194 对相邻快照**全部**因记忆块而变，静态段
+  累计重复 145,275 字符。
+  现改为与宿主自带 `dsh-time-context` 同构：在 `agent/pre-step` 里每块发一条独立消息，
+  **内容逐字未变就不发**（消息各自独立，不需要像快照那样贴占位维持稳定）；新增
+  `memory.injectVia`（`message` 缺省 / `context` 回退）与 `memory.injectIntervalMs`
+  （缺省 0 = 只在内容变化时发）。守卫 `test/inject-via-message.test.ts`（M1–M6），
+  旧通道由既有 `recall-stability` / `context-window` / `inject-dedupe-739` 等守卫在
+  `injectVia: 'context'` 下继续覆盖。
+
 - **`#997` `cg op=read` 返回体含大量调试/遥测字段**：`bm25` 统计、`path_fingerprint.provenance`
   全量、以及每条 `frontmatter` 的评分字段都会原样回给宿主，而 `budget_tokens` 只约束正文。
   新增 `_slim_read_out()`：缺省摘掉顶层与 `meta` 里的遥测块，`pack`/`results` 只留白名单键，

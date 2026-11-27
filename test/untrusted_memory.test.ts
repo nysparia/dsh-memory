@@ -78,7 +78,7 @@ async function injectedText(preview: string): Promise<string> {
   } as never
   installMemoryHooks(ctx, graph, {
     userMessage: true, assistantMessage: false, toolResult: false,
-    importance: 0.6, autoRecall: true, autoRecallLimit: 4, desensitize: true,
+    importance: 0.6, autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: true,
   })
   const handlers = listeners.get('system-prompt/assemble') || []
   assert.ok(handlers[0], '应注册 system-prompt/assemble 监听')

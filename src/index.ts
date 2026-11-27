@@ -219,8 +219,13 @@ export const Config: z<Config> = z.object({
           turns: z.number().default(10),
         })
         .default({ enabled: true, turns: 10 }),
+      /** fork 2026-11-27：注入投递通道（缺省 'message' = 自建消息）。
+       *  'context' 回退到 push assembly.contexts 的旧行为（整份快照、只追加）。 */
+      injectVia: z.union([z.const('message'), z.const('context')]).default('message'),
+      /** fork 2026-11-27：消息通道的最小发送间隔（毫秒，0 = 只在内容变化时发）。 */
+      injectIntervalMs: z.number().default(0),
     })
-    .default({ userMessage: true, assistantMessage: false, toolResult: false, importance: 0.6, autoRecall: true, autoRecallLimit: 4, autoRecallIdentity: false, turnReminder: 10, desensitize: true, dedupe: true, contextWindow: { enabled: true, turns: 10 } }),
+    .default({ userMessage: true, assistantMessage: false, toolResult: false, importance: 0.6, autoRecall: true, autoRecallLimit: 4, autoRecallIdentity: false, turnReminder: 10, desensitize: true, dedupe: true, contextWindow: { enabled: true, turns: 10 }, injectVia: 'message', injectIntervalMs: 0 }),
   toolCallTimeoutMs: z.number().default(60_000),
   maxRetryDelayMs: z.number().default(30_000),
   failOnStartupError: z.boolean().default(false),

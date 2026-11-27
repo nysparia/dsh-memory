@@ -33,7 +33,7 @@ function makeHarness(opts = {}) {
   }
   installMemoryHooks(ctx, graph, {
     userMessage: true, assistantMessage: false, toolResult: false, importance: 0.6,
-    autoRecall: true, autoRecallLimit: 4, desensitize: true,
+    autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: true,
     ...opts,
   })
   const sid = 'sess-test'
@@ -108,7 +108,7 @@ test('⑤ 无会话标识时不提醒（旧实现回落 __no_sid__ 共用计数�
   }
   installMemoryHooks(ctx, graph, {
     userMessage: true, assistantMessage: false, toolResult: false, importance: 0.6,
-    autoRecall: true, autoRecallLimit: 4, desensitize: true,
+    autoRecall: true, injectVia: 'context' as const, autoRecallLimit: 4, desensitize: true,
   })
   const emptySession = { header: {} }
   for (let i = 1; i <= 10; i++) {

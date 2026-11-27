@@ -70,7 +70,16 @@ import type {} from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+import type { ContentBlock, ContextFormed, UserMessage } from '@deepseek-ai/dsh-llm'
+
+// 消息通道（fork 2026-11-27）给注入消息声明自己的来源种类：`notice` 表示
+// 「报告一次更新」，不是一份要覆盖前文的完整状态（对照 `runtime-context` 的 `snapshot`）。
+// 只做类型增强，不引入运行期依赖（dsh-llm 是 optional peer，见 #222）。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'dsh-memory': { kind: 'dsh-memory' } & ContextFormed
+  }
+}
 import type { MdcgClient } from './lib/mdcg_client.js'
 import { escapePromptBraces, renderUntrustedMemoryBlock, stripLoneSurrogates, truncateSafe } from './lib/prompt_safety.js'
 import { HookAuditRecorder, kindOf, type HookWriteRole } from './lib/hook_audit.js'
@@ -148,6 +157,21 @@ export interface MemoryHooksOptions {
    *  可选（缺省视为 `{ enabled: true, turns: 10 }`）：既有调用方不传本项时
    *  行为与缺省一致，不改变任何既有选项语义。 */
   contextWindow?: { enabled: boolean; turns: number }
+  /** 投递通道（fork 2026-11-27，缺省 `'message'`）。
+   *
+   *  `'message'`：在 `agent/pre-step` 里**自己发消息**，每块一条，只装这一段，
+   *  内容逐字未变就不发。与宿主自带的 `dsh-time-context` 同构。
+   *
+   *  `'context'`：旧行为，push 进 `assembly.contexts`。宿主会把该集合里的**所有**
+   *  贡献者拼成一份运行时要上下文快照，且**只追加不替换**——只要本插件每步都变，
+   *  整份快照就每步重发，连 working-directory / sandbox / approval 等无关静态段
+   *  一起复制。保留此档仅为回退与对照测试。
+   */
+  injectVia?: 'message' | 'context'
+  /** 消息通道的最小发送间隔（毫秒，缺省 0 = 只在内容变化时发）。
+   *  数字 > 0 时，同一块在间隔内即使内容变化也只发一次，用于压住工具密集回合里的
+   *  高频追加（`dsh-time-context` 用同类节流，缺省 10 分钟）。 */
+  injectIntervalMs?: number
 }
 
 /** 从 ContentBlock[] 提取纯文本。 */
@@ -1138,21 +1162,27 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     return desensitize(text)
   }
 
-  // P1 完善（自动 recall 注入）：每次模型请求组装 system prompt 时，注入灵枢最近记忆。
-  // 用 system-prompt/assemble 事件（waterfall）而非 llm/stream——后者请求 deep-frozen 不可改写。
+  // ── 注入面（fork 2026-11-27）：取数/渲染单点 + 两条投递通道 ────────────────
   //
-  // ⚠️ 必须**每步都 push**，哪怕内容与上一步逐字节相同。原因在宿主侧（dsh-agent-loop 的
-  // RuntimeContextProjection）：assembly.contexts 会被渲染成一段「运行时上下文快照」，
-  // 每个 step 拿渲染后的**整段文本**与上一份已提交的快照比对，**只有不同才**在会话里
-  // append 一条新的 user/message（append 语义，旧的不会被替换或移除）。于是：
-  //   · 内容不变 + 照旧 push → 渲染文本不变 → 宿主不追加任何东西（零开销、零增长）；
-  //   · 内容不变 + 跳过 push → 渲染文本**变了**（少了本块）→ 宿主追加一份「没有本块」的
-  //     快照；下一步再 push 又把本块加回来 → **再**追加一份。跳过一次反而多花两份快照
-  //     （实测每份 ~250 tok），这正是 v0.4.8「每 8 步强制补一次」的自愈刷新会把长会话的
-  //     inject 推到 30k+ tok 的原因。
-  // 因此本实现把「要不要补」交还给宿主：压缩归档后宿主会把 retained 置空并重新投影快照
-  // （RuntimeContextProjection 的 retained === null 分支），本块自然跟着回来——
-  // 不需要插件自己数步数做自愈。
+  // 动机（本 fork 的核心改动）：旧实现把三块内容 push 进 `assembly.contexts`。
+  // 宿主把**所有** contexts 拼成一份运行时上下文快照（dsh-agent-loop 的
+  // RuntimeContextProjection），用「整段文本是否与已提交的那份相同」决定要不要
+  // 追加，且**只追加不替换**。于是只要记忆块每步都变，整份快照就每步重发一次，
+  // 连 working-directory / sandbox:policy / approval:policy 这些与记忆完全无关的
+  // 静态段一起复制。实测会话：22 份快照，其中 194 对相邻快照全部因记忆块而变，
+  // 静态段累计重复 145,275 字符。
+  //
+  // 修法与宿主自带的 dsh-time-context 同构：改在 `agent/pre-step` 自己发一条
+  // 消息，只装自己这一段。静态段的快照随之稳定（通常整个会话只有一份）。
+  // 旧通道保留在 `injectVia: 'context'`，供回退与对照测试。
+  //
+  // 为什么不在旧通道里"把文本稳定住"：那只能减少**空转**；记忆真变时仍要整份
+  // 重发。聚合边界不改，代价就还在。
+
+  /** 一块待注入内容。`body` 是**未包裹**的正文（已脱敏、已截断）；
+   *  `label` 是块标题（contexts 通道把它拼在正文前）；`name` 是归属名与去重键。 */
+  interface InjectionBlock { name: string; label: string; body: string }
+
   /** 真实轮次计数（session → 用户消息条数）。issue #645：计轮单位必须是「用户回合」，
    *  不是 assemble 次数——实测一步约 10 次 assemble，按 assemble 计数会把「每 10 轮」
    *  退化成「每一步」，提醒于是常驻上下文、agent 反复空转归档。 */
@@ -1176,247 +1206,221 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     if (n <= 0) return 0                  // 0 / 负数 = 关闭（#659 F26-21）
     return Math.min(100, n)
   })()
-  {
-    // 本 handler **恒定注册**（#657）：提醒是独立配置（memory.turnReminder），
-    // 关掉自动召回不该让它只写不读；召回部分在内部按 opts.autoRecall 门控。
+
+  /** 取数 + 渲染三块内容。分块降级：单块失败只 warn 并跳过该块，绝不越过会话流边界。 */
+  const buildInjectionBlocks = async (sid: string): Promise<InjectionBlock[]> => {
+    const blocks: InjectionBlock[] = []
     const recallLimit = Math.max(1, Math.min(10, opts.autoRecallLimit || 4))
-    ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
+    const seenKey = sid || '__no_sid__'
+    let seenMap = injectSeen.get(seenKey)
+    if (!seenMap) { seenMap = new Map<string, number>(); injectSeen.set(seenKey, seenMap) }
+
+    // ① 最近记忆（含 issue #749 跨会话 knowledge 浮现）
+    try {
+      const timelinePayload = await graph.timeline(recallLimit, sid ? { session: sid } : {})
+      // issue #749：拿最近一条用户消息做一次查询式检索，**不带会话过滤**——不走会话
+      // 过滤才可能跨会话；private/secret 属会话绑定档，服务端 _readable 会挡住。
+      let knowItems: Array<Record<string, unknown>> = []
       try {
-        // 异步取最近记忆节点（失败静默——不阻塞模型请求）
-        // 会话标识：门控内外都要用（提醒消费 + 自动召回），故先解析。
-        const hostCtx = (_ctx as unknown) as { agent?: { session?: unknown } } | undefined
-        const sid = sessionIdOf(hostCtx?.agent?.session)
-          || (observedSession ? currentSession() : '')
-        // 会话 id 为空时后端会退回全局滚动窗口（跨会话串台）。只告警一次，
-        // 避免每个 assemble step 刷日志；不改注入内容或数据路径。
-        if (!sid && !warnedEmptySid) {
-          warnedEmptySid = true
-          ctx.logger.warn('dsh-memory: 会话 id 为空，短期窗口可能退回全局滚动窗口（跨会话串台）；请检查 host.agent.session 或会话观测是否可用')
+        const q749 = sid ? lastUserText.get(sid) : undefined
+        if (q749) {
+          const kr = await graph.read(q749.slice(0, 200), { k: recallLimit })
+          knowItems = normalizeReadItems(kr)
+            // 只取非 contextual 层：contextual 由 timeline 块负责，避免同一批裸消息被两条通路各贴一遍。
+            .filter((it) => String((it || {})['layer'] ?? '') !== 'contextual')
+            // 条件闸判不可用（issue #722）的不进注入面
+            .filter((it) => it['usable'] !== false)
         }
-        // 逢十轮提醒的消费面（#657）：不受 autoRecall 门控。
-        if (sid) {
-          const pending = pendingReminder.get(sid)
-          if (pending) {
-            pendingReminder.delete(sid)
-            assembly.contexts.push({ name: 'lingshu:turn-reminder', text: pending })
-            // issue #659 F26-24：消费点留一条日志（旧实现完全静默——「提醒到底有没有
-            // 注入过」只能靠翻上下文猜）。
-            ctx.logger.info('dsh-memory: 逢十轮提醒已注入（消费一次，不重推）')
+      } catch (err) {
+        ctx.logger.info(`dsh-memory: 跨会话知识检索未生效（已跳过）: ${redactForLog(err)}`)
+      }
+      let knowText = ''
+      if (knowItems.length) {
+        const seenIds = new Set<string>()
+        const lines749: string[] = []
+        for (const it of knowItems) {
+          const id749 = String((it || {})['id'] ?? '')
+          if (!id749 || seenIds.has(id749)) continue
+          seenIds.add(id749)
+          const layer749 = String((it || {})['layer'] ?? '')
+          const prev749 = String((it || {})['preview'] ?? '').replace(/\s+/g, ' ').trim()
+          if (!prev749) continue
+          lines749.push(`- [${layer749 || 'knowledge'}] ${prev749}`)
+          if (lines749.length >= recallLimit) break
+        }
+        if (lines749.length) knowText = lines749.join('\n')
+      }
+      const timelineText = formatTimelineDecayed(dedupeRepeatedItems(timelinePayload, seenMap, 2),
+        { unit: sessionUnitOf(sid) })
+      // issue #749：knowledge 条目在前（跨会话知识），时间线在后（本会话工作记忆）
+      const text = [knowText, timelineText].filter(Boolean).join('\n')
+        + (timelineText && !timelineText.includes('身份未登记') ? '\n' + identityHint(sessionUnitOf(sid)) : '')
+      // 脱敏与截断只作用于**注入副本**（issue #354 [P1-14]）：库内原文保真。
+      // desensitize 返回 null = 整条除了占位符没有别的内容（纯凭据），此时不注入。
+      const recallBody = desensitize(truncateSafe(text, RECALL_MAX_CHARS))
+      if (recallBody) {
+        blocks.push({
+          name: 'lingshu:auto-recall',
+          label: '【灵枢最近记忆】',
+          body: recallBody,
+        })
+      }
+    } catch (err) {
+      ctx.logger.warn(`dsh-memory: 自动召回注入失败（已跳过该块）: ${redactForLog(err)}`)
+    }
+
+    // ② 身份锚点（issue #715：**独立取数**，不带会话过滤——self/anchor 恒为
+    //    unattributed，用会话过滤去筛人格节点是类别错误）
+    if (opts.autoRecallIdentity === true) {
+      try {
+        const identityPayload = await graph.timeline(IDENTITY_MAX_ITEMS * 3, {})
+        const idText = renderIdentityAnchors(identityPayload)
+        if (idText) {
+          blocks.push({
+            name: 'lingshu:identity-anchor',
+            label: '【灵枢身份锚点】（self/anchor 层，独立预算）',
+            body: idText,
+          })
+        } else {
+          ctx.logger.info(
+            'dsh-memory: autoRecallIdentity 已开启但无可注入的身份节点'
+            + '（self/anchor 层为空——请用 cg(op=identity, action=anchor) 建立锚点）')
+        }
+      } catch (err) {
+        ctx.logger.warn(`dsh-memory: 身份锚点注入失败（已跳过该块）: ${redactForLog(err)}`)
+      }
+    }
+
+    // ③ 本会话近期对话（contextWindow 注入面）
+    if (cwEnabled) {
+      try {
+        const win = await graph.sessionRecall(sid, cwTurns, WINDOW_BUDGET_TOKENS)
+        const winDegraded: unknown[] = Array.isArray((win as { degraded?: unknown })?.degraded)
+          ? (win as { degraded: unknown[] }).degraded
+          : []
+        if (winDegraded.some((d) => String(d) === 'recent_global_window')) {
+          // fail-closed：降级时原样注入等于用块标题误导模型，宁可少注入。
+          ctx.logger.warn('dsh-memory: 会话窗口取数已降级为全局窗口（缺会话标识），'
+            + '为避免跨会话注入已跳过本会话窗口块')
+        } else {
+          const winText = formatSessionWindow(win, cwTurns, { session: sid })
+          // 同 auto-recall：纯凭据窗口（desensitize → null）不注入。
+          const winSafe = winText ? desensitize(winText) : null
+          if (winSafe) {
+            blocks.push({
+              name: 'lingshu:session-window',
+              label: '【本会话近期对话】',
+              body: winSafe,
+            })
           }
         }
-        if (opts.autoRecall && graph.isReady()) {
-          // 会话隔离（P45）：自动召回只注入**本会话**的记忆，防多会话串台；
-          // 取不到会话标识则退回旧行为（不加过滤），不做半吊子猜测。
-          // ⚠️ 取值必须**每步稳定**：本块按 v0.4.8 契约每步都 push，内容一旦与上
-          // 一步不同宿主就 append 一份新快照——会话标识若中途才出现，会让「无过滤
-          // → 有过滤」翻转一次，白付两份快照。故优先取 ctx 上的会话（首步即在），
-          // 退回「最近一次 session/event 的会话」。
-          // 想读**所有**会话做了什么：别走自动召回（它会串台），显式调
-          // `stg(op=timeline, session="*")`，返回项带 session 归属。
-          // sid 已在门控外解析（提醒消费与召回共用同一份，避免两次口径漂移）。
-          // 逢十轮提醒（纪律第 16 条；issue #645 修正）：计数挪到 session/event 的真实
-          // 用户回合上，这里只消费一次待推文本。旧实现把 assemble 当轮次 + 段内永久重推
-          // ⇒ 提醒几乎常驻、agent 反复空转归档；sid 缺失时还回落共用键 __no_sid__，
-          // 并行会话互相污染频率。现改为：无 sid 不提醒；提醒只在本回合第一次 assemble 出现。
-          // （提醒消费已在门控外做掉，见上；此处不再重复——重复块是 #657 修复的残留。）
-          // 非永久层 → 既有「最近记忆」块；self/anchor → 独立「身份锚点」块（独立预算）。
-          const identityOn = opts.autoRecallIdentity === true
-          const timelinePayload = await graph.timeline(
-            recallLimit,
-            sid ? { session: sid } : {})
-          // issue #749：**跨会话 knowledge 浮现**。
-          // 病象：注入面只拉 timeline（按本会话过滤）⇒ knowledge 层永不自动浮现，跨会话等于「完全记不住」。
-          // 实测 0.9.22：注入块 4/4 条 contextual、64 个 knowledge 零浮现；同一 query 显式 read 能 rank 命中
-          // ⇒ 是**注入面未接线**，不是检索失效。
-          // 取向：拿最近一条用户消息做一次查询式检索，且**不带 session 过滤**——不走会话过滤才可能跨会话；
-          // private/secret 属会话绑定档，服务端 _readable 会挡住，故不带 session 等于「只取共享档 public/internal」。
-          let knowItems: Array<Record<string, unknown>> = []
-          try {
-            const q749 = sid ? lastUserText.get(sid) : undefined
-            if (q749) {
-              const kr = await graph.read(q749.slice(0, 200), { k: recallLimit })
-              // issue #749 修复：主库形态是 `{meta, results:[{node}]}`、热层是 `{items}`，
-              // 旧实现只认后者（而热层运行时从未构建）⇒ 本块恒空。归一后两条路径都能浮现。
-              knowItems = normalizeReadItems(kr)
-                // 只取非 contextual 层：contextual 由 timeline 块负责，避免同一批裸消息被两条通路各贴一遍。
-                .filter((it) => String((it || {})['layer'] ?? '') !== 'contextual')
-                // 条件闸判不可用（issue #722）的不进注入面
-                .filter((it) => it['usable'] !== false)
-            }
-          } catch (err) {
-            ctx.logger.info(`dsh-memory: 跨会话知识检索未生效（已跳过）: ${redactForLog(err)}`)
-          }
-          // issue #715（2026-10-30 外部报告，逐行复现）：**身份块必须单独取数**。
-          //
-          // 病灶：此前身份块复用上面这份**带会话过滤**的 payload（还把 limit 加 3 试图
-          // 「多取 3 条」），但 `self`/`anchor` 节点的 `session` **恒为 `unattributed`**
-          // ——身份锚点在语义上就注定跨会话（`identity` 写入不带 session_id 时即如此，
-          // 状态卡与关系节点同理）。两者叠加 ⇒ 永久层被会话过滤全部滤掉 ⇒
-          // `renderIdentityAnchors` 拿到空集 ⇒ **块从不出现且无任何报错**（静默失效）。
-          //
-          // 这正是《身份与人格》理论的 R3：**人格的可见性不该由会话决定**。
-          // 用会话过滤去筛人格节点是**类别错误**，不是参数没调好。
-          //
-          // 故身份块改为**不带会话过滤**取数（不传 session ⇒ 跨会话视图），
-          // 再由 `renderIdentityAnchors` 只挑 self/anchor（其余层照样被它跳过）。
-          // 「最近记忆」块保持会话隔离不变——那是工作记忆，本就该跟会话走。
-          const identityPayload = identityOn
-            ? await graph.timeline(IDENTITY_MAX_ITEMS * 3, {})
-            : null
-          // issue #739：同一会话内同一条最多注入 2 次（见 dedupeRepeatedItems 的实测数据）。
-          const seenKey = sid || '__no_sid__'
-          let seenMap = injectSeen.get(seenKey)
-          if (!seenMap) { seenMap = new Map<string, number>(); injectSeen.set(seenKey, seenMap) }
-          // issue #749：把查询式检索到的 knowledge 条目并入「最近记忆」块（在时间线之前），
-          // 让跨会话知识能自动浮现；条目带 [layer] 前缀（与时间线渲染同格式），并按 id 去重。
-          let knowText = ''
-          if (knowItems.length) {
-            const seenIds = new Set<string>()
-            const lines749: string[] = []
-            for (const it of knowItems) {
-              const id749 = String((it || {})['id'] ?? '')
-              if (!id749 || seenIds.has(id749)) continue
-              seenIds.add(id749)
-              const layer749 = String((it || {})['layer'] ?? '')
-              const prev749 = String((it || {})['preview'] ?? '').replace(/\s+/g, ' ').trim()
-              if (!prev749) continue
-              lines749.push(`- [${layer749 || 'knowledge'}] ${prev749}`)
-              if (lines749.length >= recallLimit) break
-            }
-            if (lines749.length) knowText = lines749.join('\n')
-          }
-          const timelineText = formatTimelineDecayed(dedupeRepeatedItems(timelinePayload, seenMap, 2),
-            { unit: sessionUnitOf(sid) })
-          // issue #749：knowledge 条目在前（跨会话知识），时间线在后（本会话工作记忆）
-          const text = [knowText, timelineText].filter(Boolean).join('\n')
-            + (timelineText && !timelineText.includes('身份未登记') ? '\n' + identityHint(sessionUnitOf(sid)) : '')
-          if (text) {
-            // 注入边界转义（issue #16）：宿主 system-prompt 对 context 文本做严格
-            // `{{variable}}` 插值，裸 `{{` 会 throw → 该轮请求整体失败。记忆原文
-            // （含用户命令里的 `{{.X}}`）必须保真落库，故只在注入副本上打断 `{{`。
-            //
-            // H5（不可信内容边界）：注入块**必经** renderUntrustedMemoryBlock——
-            // 固定声明句（UNTRUSTED_MEMORY_NOTICE，常量单点）+ 显式边界标记 +
-            // 载荷内边界标记的打断。记忆是任意用户输入/工具输出的沉淀，
-            // 无边界时模型无从区分「数据」与「指令」（提示注入面）。
-            // 三层顺序：边界渲染（含载荷打断）→ `{{` 转义；两者都只改注入副本。
-            //
-            // issue #354 [P1-14]：注入副本还须**过脱敏**——旧实现只在写入侧
-            // （saveTurn → sanitize → remember）挂脱敏，注入侧直接把库内原文
-            // push 进系统提示词。历史遗留 / 直接写库 / 绕过写入脱敏的凭据因此
-            // 原样回显进模型上下文。脱敏与写入侧开关**解耦**：`opts.desensitize`
-            // 是「记忆库里存不存原文」的数据面选择，注入是**导出面**——库里的
-            // 原文不得因该开关而被搬到模型上下文（读侧 fail-closed）。
-            // 脱敏只作用于**载荷正文**（标题是常量、不参与判据）。
-            // ⚠️ 诚实边界（复核意见 3）：渲染文本自带层级/角色前缀（`- [contextual] `、
-            // `[user] `），故「正文整条皆凭据」时 desensitize 的残渣仍非空 ⇒ 该块**照常
-            // 注入**，内容是前缀 + `[已过滤:密钥]`。真正的保证是**凭据原文不出现在上下文**
-            // （一定被替换成占位），而不是「不注入」；`if (recallBody)` 只是兜底，
-            // 覆盖渲染文本本身即纯凭据（无前缀）的形态。
-            const recallBody = desensitize(truncateSafe(text, RECALL_MAX_CHARS))   // issue #762
-            // issue #739：同一批记忆每轮原样重贴会诱发整段复述 => 块级去重/增量。
-            const _rb = deltaBlock(prevInjected(sid, 'auto-recall'), recallBody || '', '【灵枢最近记忆】')
-            if (_rb.mode !== 'stub') noteInjected(sid, 'auto-recall', recallBody || '')
-            const recallOut = _rb.text
-            if (recallOut) {
-              assembly.contexts.push({
-                name: 'lingshu:auto-recall',
-                text: escapePromptBraces(renderUntrustedMemoryBlock(recallOut)),
-              })
-            }
-          }
-          if (identityOn) {
-            try {
-              // issue #715：用**独立取数**的 payload（不带会话过滤），不再复用已滤会话的那份。
-              const idText = renderIdentityAnchors(identityPayload)
-              if (idText) {
-                // issue #739：身份锚点天然每轮相同（实测属「稳定核心+每轮重贴」形态）
-                // => 逐轮相同就只贴占位，保留「有这块」的信号，去掉复述原料。
-                const _ib = deltaBlock(prevInjected(sid, 'identity'), idText, '【灵枢身份锚点】（self/anchor 层，独立预算）')
-                if (_ib.mode !== 'stub') noteInjected(sid, 'identity', idText)
-                assembly.contexts.push({
-                  name: 'lingshu:identity-anchor',
-                  text: escapePromptBraces(renderUntrustedMemoryBlock(_ib.text)),
-                })
-              } else {
-                // issue #715（静默失效）：此前「开关开了但块从不出现」与「库里确实没有
-                // self/anchor 节点」**完全不可分辨**——catch 不触发（没抛错），也没有任何
-                // 提示。开着的功能不生效却无声，比报错更难查。故此处显式留痕。
-                ctx.logger.info(
-                  'dsh-memory: autoRecallIdentity 已开启但无可注入的身份节点'
-                  + '（self/anchor 层为空——请用 cg(op=identity, action=anchor) 建立锚点）')
-              }
-            } catch (err) {
-              // issue #128 同款纪律：fail-soft 但不静默——空 catch 会被
-              // test/session-declaration-report ③ 判红，也会让「身份块从未注入成功」
-              // 与「确实没有身份节点」不可分辨。失败不越过会话流边界（不抛）。
-              ctx.logger.warn(`dsh-memory: 身份锚点注入失败（已跳过该块）: ${redactForLog(err)}`)
-            }
-          }
-          // ── 独立第二块：「【本会话近期对话】」（contextWindow 注入面）──
-          // 与上方 timeline 块**块名/取数/开关各自独立**（既有块一字未动）。
-          // 稳定性口径与既有块同等：**每步都 push**（内容随新轮增长属预期——
-          // 宿主对内容变化追加快照的既有行为不变；窗口不变时两块逐字节相同）。
-          // fail-soft：取数/渲染失败 → 静默、不 push 第二块，绝不抛——且因
-          // 上方既有块已先 push，本块的失败**不影响**既有块（反之亦然）。
-          // 门控 = 注入面总开关 autoRecall（本 handler 的注册条件）× 本机制开关
-          // contextWindow.enabled。
-          if (cwEnabled) {
-            try {
-              const win = await graph.sessionRecall(sid, cwTurns, WINDOW_BUDGET_TOKENS)
-              // issue #712：sid 交服务端**按会话取数**（真值时严格过滤）与行内归因；
-              // 前端不再二次过滤（两份判据会分裂，本仓已多次栽在这上面）。
-              // 2026-11-01 实测补充：服务端在**会话标识缺失**时会把 recent 段降级为
-              // **全局窗口**，并在 payload.degraded 标注 'recent_global_window'
-              // （md_cg/mdcos.py 的 session_recall）。本块语义是「本会话近期对话」——
-              // 降级时原样注入等于用块标题误导模型（多窗口下会把其他会话/历史条目
-              // 当成本会话输入；本仓 #65 同族事故的注入面残口）。fail-closed：降级时
-              // 不注入本块（timeline 块不受影响），并显式留痕——宁可少注入，不错块。
-              const winDegraded: unknown[] = Array.isArray((win as { degraded?: unknown })?.degraded)
-                ? (win as { degraded: unknown[] }).degraded
-                : []
-              if (winDegraded.some((d) => String(d) === 'recent_global_window')) {
-                ctx.logger.warn('dsh-memory: 会话窗口取数已降级为全局窗口（缺会话标识），'
-                  + '为避免跨会话注入已跳过本会话窗口块')
-              } else {
-                const winText = formatSessionWindow(win, cwTurns, { session: sid })
-                if (winText) {
-                  // 注入边界同规（文件头硬约束）：不可信内容边界 + `{{` 转义，
-                  // 都只改注入副本——窗口原文在库内保真。
-                  // issue #354 [P1-14] 同族：窗口块也是注入面，同样过脱敏（理由与
-                  // 诚实边界见上方 auto-recall 块）——渲染文本自带 `[role] ` 前缀，
-                  // 故「整条皆凭据」时该块仍会注入，但凭据原文一定被替换成占位。
-                  const winSafe = desensitize(winText)
-                  // issue #739：窗口每轮都是「最近 N 轮」，轮间大量重叠 => 只贴增量。
-                  // 前缀关系成立时只注入新增部分；不成立（被改写/截断）回 full；
-                  // 逐字相同则贴一行占位，不再重贴正文。
-                  const _wb = deltaBlock(prevInjected(sid, 'window'), winSafe || '', '【本会话近期对话】')
-                  if (_wb.mode !== 'stub') noteInjected(sid, 'window', winSafe || '')
-                  if (_wb.text) {
-                    assembly.contexts.push({
-                      name: 'lingshu:session-window',
-                      text: escapePromptBraces(renderUntrustedMemoryBlock(_wb.text)),
-                    })
-                  }
-                }
-              }
-            } catch (err) {
-              // issue #128（2026-10-12）：**空 catch 改为显式回报**。此前这里是
-              // 一个静默空 catch——窗口取数失败（含桥未实现该方法、
-              // session_recall 报错）在盘面与日志面**双双无痕**，与「本会话确实
-              // 没有近期对话」不可分辨（自动召回块「从未注入成功」正是靠这个
-              // 静默吞掉的）。失败仍不得越过会话流边界（不抛），但必须留痕。
-              ctx.logger.warn(`dsh-memory: 本会话窗口注入失败（已跳过该块）: ${redactForLog(err)}`)
-            }
+      } catch (err) {
+        ctx.logger.warn(`dsh-memory: 本会话窗口注入失败（已跳过该块）: ${redactForLog(err)}`)
+      }
+    }
+    return blocks
+  }
+
+  /** 投递通道：`message`（缺省，自建消息）或 `context`（旧行为，整份快照）。 */
+  const injectVia = opts.injectVia ?? 'message'
+  /** 消息通道的最小发送间隔（毫秒）。0 = 只在内容变化时发（缺省）。 */
+  const injectGapMs = (() => {
+    const raw = opts.injectIntervalMs
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) return 0
+    return Math.max(0, Math.floor(raw))
+  })()
+  /** 消息通道的逐块发送账：会话 → 块名 → { 上次正文, 时刻 }。
+   *  内容逐字未变就**不发**——消息各自独立，不需要像快照那样贴占位维持稳定。 */
+  const lastSent = new Map<string, Map<string, { body: string; at: number }>>()
+
+  // `@deepseek-ai/dsh-llm` 是 optional peer（#222：缺包时整包仍必须能加载），
+  // 故在真正要发消息时才惰性解析；解析不到就跳过注入（宿主没有 llm 时也没有模型请求）。
+  let llmModule: typeof import('@deepseek-ai/dsh-llm') | null | undefined
+  const makeMemoryMessage = async (block: InjectionBlock): Promise<UserMessage | null> => {
+    if (llmModule === undefined) {
+      try { llmModule = await import('@deepseek-ai/dsh-llm') } catch { llmModule = null }
+    }
+    if (llmModule === null) return null
+    const text = escapePromptBraces(renderUntrustedMemoryBlock(block.label + '\n' + block.body))
+    return llmModule.createUserMessage({
+      content: [{ type: 'text', text }],
+      // `notice`：这条消息报告「记忆面更新了什么」，不是一份要覆盖前文的完整状态。
+      source: { kind: 'dsh-memory', form: 'notice', summary: block.label },
+    })
+  }
+
+  // 本 handler **恒定注册**（#657）：提醒是独立配置（memory.turnReminder），
+  // 关掉自动召回不该让它只写不读；召回部分在内部按 injectVia / opts.autoRecall 门控。
+  ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
+    try {
+      const hostCtx = (_ctx as unknown) as { agent?: { session?: unknown } } | undefined
+      const sid = sessionIdOf(hostCtx?.agent?.session)
+        || (observedSession ? currentSession() : '')
+      // 会话 id 为空时后端会退回全局滚动窗口（跨会话串台）。只告警一次。
+      if (!sid && !warnedEmptySid) {
+        warnedEmptySid = true
+        ctx.logger.warn('dsh-memory: 会话 id 为空，短期窗口可能退回全局滚动窗口（跨会话串台）；请检查 host.agent.session 或会话观测是否可用')
+      }
+      // 逢十轮提醒的消费面（#657）：不受 autoRecall / injectVia 门控。
+      if (sid) {
+        const pending = pendingReminder.get(sid)
+        if (pending) {
+          pendingReminder.delete(sid)
+          assembly.contexts.push({ name: 'lingshu:turn-reminder', text: pending })
+          ctx.logger.info('dsh-memory: 逢十轮提醒已注入（消费一次，不重推）')
+        }
+      }
+      // 旧通道：整份快照。仅在 injectVia='context' 时使用（回退/对照）。
+      if (injectVia === 'context' && opts.autoRecall && graph.isReady()) {
+        const blocks = await buildInjectionBlocks(sid)
+        for (const block of blocks) {
+          const delta = deltaBlock(prevInjected(sid, block.name), block.body, block.label)
+          if (delta.mode !== 'stub') noteInjected(sid, block.name, block.body)
+          if (delta.text) {
+            assembly.contexts.push({
+              name: block.name,
+              text: escapePromptBraces(renderUntrustedMemoryBlock(delta.text)),
+            })
           }
         }
       }
-      catch (err) {
-        // issue #128：同上——召回取数/渲染失败此前被空 catch 吞成「无痕」，
-        // 现改为显式回报（不抛，仍不阻塞模型请求）。
-        ctx.logger.warn(`dsh-memory: 自动召回注入失败（已跳过该块）: ${redactForLog(err)}`)
+    } catch (err) {
+      ctx.logger.warn(`dsh-memory: 自动召回注入失败（已跳过该块）: ${redactForLog(err)}`)
+    }
+    return next()
+  })
+
+  // ── 新通道：`agent/pre-step` 自建消息（缺省）──────────────────────────────
+  // 每块一条独立 user 消息，只装自己这一段；静态上下文不再被拖着重发。
+  if (injectVia === 'message') {
+    ctx.on('agent/pre-step', async (payload, next) => {
+      const decision = await next()
+      if (decision?.kind === 'reject') return decision
+      if (payload.signal?.aborted) return decision
+      if (!opts.autoRecall || !graph.isReady()) return decision
+      const sid = sessionIdOf((payload.agent as { session?: unknown } | undefined)?.session)
+        || (observedSession ? currentSession() : '')
+      // 无会话标识时不注入：宁可少注入，也不把别的会话的记忆贴进来。
+      if (!sid) return decision
+      const blocks = await buildInjectionBlocks(sid)
+      if (blocks.length === 0) return decision
+      const now = Date.now()
+      let sent = lastSent.get(sid)
+      if (!sent) { sent = new Map<string, { body: string; at: number }>(); lastSent.set(sid, sent) }
+      const messages: UserMessage[] = []
+      for (const block of blocks) {
+        const prev = sent.get(block.name)
+        // 内容逐字未变 → 不发。这是消息通道相对快照通道的关键优势：
+        // 不必用占位维持"有这块"的信号，因为块的存在与否不影响别的消息。
+        if (prev && prev.body === block.body) continue
+        if (prev && injectGapMs > 0 && now - prev.at < injectGapMs) continue
+        const message = await makeMemoryMessage(block)
+        if (!message) continue
+        sent.set(block.name, { body: block.body, at: now })
+        messages.push(message)
       }
-      return next()
+      if (messages.length === 0) return decision
+      return { ...decision, messages: [...decision.messages, ...messages] }
     })
   }
 
